@@ -156,14 +156,14 @@ st.caption("Digitalization in Chemical Engineering — Caustic Absorption Plant 
 with st.sidebar:
     st.header("📁 แหล่งข้อมูล")
     up = st.file_uploader("อัปโหลดไฟล์ PHE_Performance_Analysis (.xlsx)", type=["xlsx"])
-    blob = up.getvalue() if up else (open(DEFAULT_FILE, "rb").read() if os.path.exists(DEFAULT_FILE) else None)
+    blob = up.getvalue() if up else None  # ต้องอัปโหลดไฟล์ก่อนจึงจะแสดงผล
     with st.expander("⚠️ อัตราการไหลฐาน (ค่าสมมติ)"):
         st.number_input("Lye flow (m³/hr)", 0.5, 50.0, 7.0, 0.5, key="vl0")
         st.number_input("Cooling water flow (m³/hr)", 0.5, 80.0, 10.0, 0.5, key="vw0")
         st.caption("ยังไม่มีค่าจริงจาก pump nameplate — เมื่อได้ค่าจริงให้แก้ตรงนี้ โมเดลทั้งหมดจะคำนวณใหม่")
 
 if blob is None:
-    st.info("กรุณาอัปโหลดไฟล์ข้อมูลที่แถบด้านซ้าย (หรือวางไฟล์ในโฟลเดอร์เดียวกับ app.py) ครับ")
+    st.info("👈 กรุณาอัปโหลดไฟล์ข้อมูล Plant Data (.xlsx) ที่แถบด้านซ้ายก่อน ระบบจึงจะวิเคราะห์และเปิดตัวจำลองครับ")
     st.stop()
 try:
     raw = load_plant(blob)
