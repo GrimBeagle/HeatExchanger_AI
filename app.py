@@ -7,11 +7,17 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 from scipy.stats import linregress
-from sklearn.ensemble import IsolationForest, RandomForestRegressor
+import warnings
+from sklearn.ensemble import GradientBoostingRegressor, IsolationForest, RandomForestRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+warnings.filterwarnings("ignore")
 st.set_page_config(page_title="AI-Based Heat Exchanger Digital Twin", page_icon="🌡️", layout="wide")
 
 RHO_L, CP_L, RHO_W, CP_W = 1450.0, 3200.0, 996.0, 4180.0  # NaOH 43% / น้ำหล่อเย็น
@@ -115,36 +121,128 @@ def derive(d: pd.DataFrame, vl: float, vw: float) -> pd.DataFrame:
     return out
 
 
+def _ml(name):
+    if name == "RandomForest":
+        return RandomForestRegressor(200, min_samples_leaf=5, random_state=0)
+    if name == "GradientBoosting":
+        return GradientBoostingRegressor(n_estimators=150, max_depth=2, learning_rate=0.05, random_state=0)
+    if name == "Ridge":
+        return Ridge(1.0)
+    return GaussianProcessRegressor(ConstantKernel(1.0) * RBF([5.0, 5.0]) + WhiteKernel(0.5), normalize_y=True, random_state=0)
+
+
 @st.cache_data(show_spinner="กำลังเทรนโมเดลจากข้อมูลจริง...")
 def train(D: pd.DataFrame, phe: str, vl: float, vw: float) -> dict:
     s = D[D.phe == phe].dropna(subset=FEATS_IF + ["Q"])
     s = s[(s.Q > 0) & (s.UA > 0)].reset_index(drop=True)
     X, y = s[["th_i", "tc_i"]].values, s.th_o.values
 
-    # ประเมินโมเดลแบบ time-series CV (ไม่ใช้อนาคตทำนายอดีต)
-    res = {"RandomForest (AI)": [], "Physics ε-NTU": [], "Naive (ΔT เฉลี่ย)": []}
-    ytrue, rf_err = [], []
+    # ประเมินแบบ time-series CV (ทดสอบกับช่วงเวลาที่โมเดลไม่เคยเห็น)
+    ML = ["RandomForest", "GradientBoosting", "Ridge", "GaussianProcess"]
+    P = {k: np.full(len(s), np.nan) for k in ML + ["Physics ε-NTU", "Hybrid (Physics+RF)", "Naive (ΔT เฉลี่ย)"]}
     for tr, te in TimeSeriesSplit(5).split(X):
-        rf = RandomForestRegressor(200, min_samples_leaf=5, random_state=0).fit(X[tr], y[tr])
-        p_rf = rf.predict(X[te])
-        p_ph = predict(s.th_i.values[te], s.tc_i.values[te], np.median(s.UA.values[tr]), vl, vw)[0]
-        p_nv = s.th_i.values[te] - np.mean(s.th_i.values[tr] - y[tr])
-        for k, p in zip(res, (p_rf, p_ph, p_nv)):
-            res[k].append(np.abs(p - y[te]))
-        rf_err.append(p_rf - y[te])
-    metrics = pd.DataFrame({"MAE ของ Lye outlet (°C)": {k: np.concatenate(v).mean() for k, v in res.items()}}).round(3)
-    sigma = max(float(np.std(np.concatenate(rf_err))), 0.3)
+        ua0 = np.median(s.UA.values[tr])
+        ph_tr = predict(s.th_i.values[tr], s.tc_i.values[tr], ua0, vl, vw)[0]
+        ph_te = predict(s.th_i.values[te], s.tc_i.values[te], ua0, vl, vw)[0]
+        for k in ML:
+            P[k][te] = _ml(k).fit(X[tr], y[tr]).predict(X[te])
+        P["Physics ε-NTU"][te] = ph_te
+        P["Hybrid (Physics+RF)"][te] = ph_te + _ml("RandomForest").fit(X[tr], y[tr] - ph_tr).predict(X[te])
+        P["Naive (ΔT เฉลี่ย)"][te] = s.th_i.values[te] - np.mean(s.th_i.values[tr] - y[tr])
+    mask = ~np.isnan(P["Naive (ΔT เฉลี่ย)"])
+    rows = {}
+    for k, p in P.items():
+        e = p[mask] - y[mask]
+        rows[k] = {"MAE (°C)": np.mean(np.abs(e)), "RMSE (°C)": np.sqrt(np.mean(e ** 2)), "R²": r2_score(y[mask], p[mask])}
+    metrics = pd.DataFrame(rows).T.round(3)
+    cv = pd.DataFrame({"Time": s.Time, "actual": y, **P})[mask].reset_index(drop=True)
+    sigma = max(float(np.std(P["RandomForest"][mask] - y[mask])), 0.3)
 
-    rf = RandomForestRegressor(200, min_samples_leaf=5, random_state=0).fit(X, y)
+    rf = _ml("RandomForest").fit(X, y)
     iso = make_pipeline(StandardScaler(), IsolationForest(n_estimators=300, contamination=0.05, random_state=0))
     iso.fit(s[FEATS_IF])
     s["score"] = iso.decision_function(s[FEATS_IF])
     s["anom"] = iso.predict(s[FEATS_IF]) == -1
     return dict(
-        rf=rf, iso=iso, sigma=sigma, metrics=metrics, scored=s,
+        rf=rf, iso=iso, sigma=sigma, metrics=metrics, cv=cv, scored=s,
         ua_med=float(s.UA.median()), ua_lo=float(s.UA.quantile(.05)), ua_hi=float(s.UA.quantile(.95)),
         rng={c: (float(s[c].min()), float(s[c].max())) for c in ("th_i", "tc_i", "th_o")},
     )
+
+
+@st.cache_data(show_spinner=False)
+def ua_band(s: pd.DataFrame, vl: float, vw: float, n: int = 300):
+    """Monte Carlo: ใส่ความคลาดเคลื่อนการอ่านมือ ±0.5 °C แล้วดูช่วง 5–95% ของ UA"""
+    r = np.random.default_rng(0)
+    sims = []
+    for _ in range(n):
+        e = {c: s[c].values + r.uniform(-0.5, 0.5, len(s)) for c in ("th_i", "th_o", "tc_i", "tc_o")}
+        sims.append(calc(e["th_i"], e["th_o"], e["tc_i"], e["tc_o"], vl, vw)["UA"])
+    sims = np.array(sims, float)
+    return np.nanpercentile(sims, 5, axis=0), np.nanpercentile(sims, 95, axis=0)
+
+
+@st.cache_data(show_spinner=False)
+def load_log(blob: bytes) -> pd.DataFrame:
+    try:
+        x = pd.read_excel(io.BytesIO(blob), sheet_name="Summary Statistics", header=None)
+        i = x.index[x[0].astype(str).str.contains("DATA QUALITY LOG")][0]
+        rows = []
+        for j in range(i + 1, len(x)):
+            if pd.isna(x.iloc[j, 0]):
+                break
+            rows.append({"สถานะ": x.iloc[j, 0], "เวลา": x.iloc[j, 1],
+                         "รายละเอียด": next((v for v in x.iloc[j, 2:] if pd.notna(v)), "")})
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner="กำลังคำนวณ sensitivity...")
+def sens_table(raw: pd.DataFrame, vl: float, vw: float) -> pd.DataFrame:
+    rows = []
+    for fl in (0.7, 0.85, 0.95, 1.0, 1.05, 1.15, 1.3):
+        for fw in (0.7, 1.0, 1.3):
+            Dx = derive(raw, vl * fl, vw * fw)
+            r = {"Lye flow ×": fl, "Water flow ×": fw}
+            for p in PHES:
+                s = Dx[Dx.phe == p].dropna(subset=["UA", "eps", "day"])
+                s = s[s.UA > 0]
+                lr = linregress(s.day, s.UA)
+                r[f"UA {p}"] = round(s.UA.median())
+                r[f"ε {p}"] = round(s.eps.mean(), 3)
+                r[f"แนวโน้ม UA {p} (%/วัน)"] = round(lr.slope / s.UA.median() * 100, 2)
+                r[f"p {p}"] = round(lr.pvalue, 3)
+            rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def inject(s, sev, vl, vw, ua_med, rng):
+    """Fault injection: ใช้อุณหภูมิขาเข้าจริง แต่ทำให้ UA ลดลง sev (สัดส่วน) แล้วสร้างค่าที่ 'วัดได้' (ปัดเป็น 1 °C + noise)"""
+    tho, tco = predict(s.th_i.values, s.tc_i.values, ua_med * (1 - sev), vl, vw)[:2]
+    tho = np.round(tho + rng.normal(0, .3, len(s)))
+    tco = np.round(tco + rng.normal(0, .3, len(s)))
+    c = calc(s.th_i.values, tho, s.tc_i.values, tco, vl, vw)
+    return pd.DataFrame({"th_i": s.th_i.values, "tc_i": s.tc_i.values, "th_o": tho, "tc_o": tco, "eps": c["eps"], "UA": c["UA"]})
+
+
+def detect(df, m):
+    z = (df.th_o.values - m["rf"].predict(df[["th_i", "tc_i"]].values)) / m["sigma"]
+    sd = m["scored"].UA.std()
+    hi = pd.Series(df.UA.values).rolling(12, min_periods=6).median().values / m["ua_med"]
+    return {
+        "RF residual > 2σ": z > 2,
+        "Isolation Forest": m["iso"].predict(df[FEATS_IF]) == -1,
+        "Control chart UA < μ−2σ": df.UA.values < m["ua_med"] - 2 * sd,
+        "Health Index (12 จุด) < 85%": hi < 0.85,
+    }
+
+
+def cb_use_est():
+    v = st.session_state.get("_vw_est")
+    if v and v == v:
+        v = float(np.clip(v, 0.5, 80.0))
+        st.session_state.vw0, st.session_state.vw = v, v
 
 
 # ============================================================
@@ -155,18 +253,22 @@ st.caption("Digitalization in Chemical Engineering — Caustic Absorption Plant 
 
 with st.sidebar:
     st.header("📁 แหล่งข้อมูล")
-    up = st.file_uploader("อัปโหลดไฟล์ PHE_Performance_Analysis (.xlsx)", type=["xlsx"])
-    blob = up.getvalue() if up else None  # ต้องอัปโหลดไฟล์ก่อนจึงจะแสดงผล
+    ups = st.file_uploader("อัปโหลดไฟล์ PHE_Performance_Analysis (.xlsx) — เลือกได้หลายไฟล์ ระบบจะรวมให้", type=["xlsx"],
+                           accept_multiple_files=True)  # ต้องอัปโหลดก่อนจึงจะแสดงผล
     with st.expander("⚠️ อัตราการไหลฐาน (ค่าสมมติ)"):
         st.number_input("Lye flow (m³/hr)", 0.5, 50.0, 7.0, 0.5, key="vl0")
         st.number_input("Cooling water flow (m³/hr)", 0.5, 80.0, 10.0, 0.5, key="vw0")
         st.caption("ยังไม่มีค่าจริงจาก pump nameplate — เมื่อได้ค่าจริงให้แก้ตรงนี้ โมเดลทั้งหมดจะคำนวณใหม่")
+    with st.expander("ข้อมูล datasheet (ถ้ามี) → คำนวณ Rf"):
+        st.number_input("พื้นที่แลกเปลี่ยนความร้อน A (m²) — 0 = ไม่ทราบ", 0.0, 10000.0, 0.0, 1.0, key="A_hx")
+        st.number_input("U_clean (W/m²K) — 0 = ไม่ทราบ", 0.0, 10000.0, 0.0, 10.0, key="U_clean")
 
-if blob is None:
+if not ups:
     st.info("👈 กรุณาอัปโหลดไฟล์ข้อมูล Plant Data (.xlsx) ที่แถบด้านซ้ายก่อน ระบบจึงจะวิเคราะห์และเปิดตัวจำลองครับ")
     st.stop()
 try:
-    raw = load_plant(blob)
+    raw = (pd.concat([load_plant(u.getvalue()) for u in ups]).drop_duplicates("Time")
+           .sort_values("Time").reset_index(drop=True))
 except Exception as e:
     st.error(f"อ่านไฟล์ไม่สำเร็จ: {e}\n\nต้องมีชีต 'Raw Data' (หัวตารางแถวที่ 4, ข้อมูลเริ่มแถวที่ 5)")
     st.stop()
@@ -264,7 +366,8 @@ iso_flag = bool(m["iso"].predict(feat)[0] == -1)
 ua_ratio = float(c["UA"]) / m["ua_med"]
 inside = all(m["rng"][k][0] - 0.5 <= v <= m["rng"][k][1] + 0.5 for k, v in (("th_i", th), ("tc_i", tc)))
 
-tab1, tab2, tab3 = st.tabs(["1️⃣ Plant Data & AI Baseline", "2️⃣ Interactive Simulator", "3️⃣ AI Diagnostics"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["1️⃣ Plant Data & AI Baseline", "2️⃣ Interactive Simulator", "3️⃣ AI Diagnostics",
+                                              "4️⃣ Fouling Lab", "5️⃣ Flow Sensitivity", "6️⃣ Model & Limitations"])
 
 # ------------------------------------------------------------
 with tab1:
@@ -309,7 +412,7 @@ with tab1:
     for col, p in zip((cA, cB), PHES):
         col.markdown(f"**{p}**")
         col.dataframe(M[p]["metrics"], use_container_width=True)
-    st.caption("เทียบ AI (Random Forest) กับ Physics และ Naive โดยทดสอบกับช่วงเวลาที่โมเดลไม่เคยเห็น "
+    st.caption("เทียบ AI 4 แบบ, Physics, Hybrid (Physics+RF) และ Naive โดยทดสอบกับช่วงเวลาที่โมเดลไม่เคยเห็น "
                "ข้อมูลอ่านมือละเอียด 1 °C จึงมี noise ระดับ ~0.5–1 °C")
 
     with st.expander("ดูข้อมูลดิบและตารางที่คำนวณแล้ว"):
@@ -401,3 +504,281 @@ with tab3:
                 "(3) Isolation Forest ตรวจว่าสภาวะรวม (T, ε) อยู่นอกรูปแบบที่เคยเห็นหรือไม่")
     st.caption("หมายเหตุ: ข้อมูลจริง 14 วันเป็นสภาพเครื่องที่ยังปกติ จึงเรียนรู้ได้เฉพาะ 'ลักษณะปกติ' — "
                "สถานการณ์ fouling/flow drop มาจากแบบจำลองฟิสิกส์ ไม่ใช่ข้อมูลความเสียหายจริง")
+
+
+# ============================================================
+# เพิ่มเติมในแท็บ 1: Validation, ความไม่แน่นอนของ UA, Data cleaning
+# ============================================================
+with tab1:
+    st.divider()
+    st.subheader("Validation: โมเดลตรงกับของจริงแค่ไหน")
+    v1, v2 = st.columns([1, 2])
+    vphe = v1.radio("เครื่อง", PHES, key="val_phe", horizontal=True)
+    vmod = v2.selectbox("โมเดลที่ต้องการดู", list(M[vphe]["metrics"].index), index=0, key="val_model")
+    cv = M[vphe]["cv"]
+    fv = go.Figure()
+    fv.add_scatter(x=cv.actual, y=cv[vmod], mode="markers", name="CV prediction", opacity=0.6)
+    lo_, hi_ = float(cv.actual.min()) - 1, float(cv.actual.max()) + 1
+    fv.add_scatter(x=[lo_, hi_], y=[lo_, hi_], mode="lines", name="y = x", line_dash="dash")
+    fv.update_layout(xaxis_title="Lye outlet จริง (°C)", yaxis_title="Lye outlet ที่ทำนาย (°C)", height=380,
+                     title=f"{vphe}: {vmod} (ทดสอบข้ามเวลา)")
+    st.plotly_chart(fv, use_container_width=True)
+    sv = M[vphe]["scored"]
+    tco_p = predict(sv.th_i.values, sv.tc_i.values, M[vphe]["ua_med"], vl0, vw0)[1]
+    st.caption(f"MAE ของ Water outlet จากแบบจำลองฟิสิกส์ = {np.mean(np.abs(tco_p - sv.tc_o.values)):.2f} °C "
+               "(สูงกว่าฝั่ง lye เพราะ flow น้ำเป็นค่าสมมติ — ดูแท็บ Flow Sensitivity)")
+
+    st.subheader("ความไม่แน่นอนของ UA (Monte Carlo ±0.5 °C)")
+    lo_b, hi_b = ua_band(sv, vl0, vw0)
+    fu = go.Figure()
+    fu.add_scatter(x=sv.Time, y=hi_b, mode="lines", line_width=0, showlegend=False)
+    fu.add_scatter(x=sv.Time, y=lo_b, mode="lines", line_width=0, fill="tonexty", name="ช่วง 5–95%")
+    fu.add_scatter(x=sv.Time, y=sv.UA, mode="lines+markers", name="UA จากข้อมูล", marker_size=4)
+    fu.update_layout(yaxis_title="UA (W/K)", height=360, title=f"{vphe}: UA พร้อมช่วงความไม่แน่นอน")
+    st.plotly_chart(fu, use_container_width=True)
+    rel = np.nanmedian((hi_b - lo_b) / 2 / sv.UA.values) * 100
+    st.info(f"ความคลาดเคลื่อนการอ่านมือ ±0.5 °C ทำให้ UA ของแต่ละจุดไม่แน่นอนประมาณ ±{rel:.0f}% "
+            "ดังนั้นควรตัดสินแนวโน้มจากค่าเฉลี่ยเคลื่อนที่ ไม่ใช่จุดเดียว")
+
+    st.subheader("ตารางสรุปการทำความสะอาดข้อมูล")
+    log = load_log(ups[0].getvalue())
+    if len(log):
+        st.dataframe(log, hide_index=True, use_container_width=True)
+    eff = []
+    for p_ in (1, 2):
+        before = (raw[f"P{p_}_li"] - raw[f"P{p_}_lo"]).median()
+        after = D[D.phe == f"PHE#{p_}"].dP_l.median()
+        eff.append({"เครื่อง": f"PHE#{p_}", "ความดันผิดปกติที่ตัดออก (จุด)": int(D[D.phe == f"PHE#{p_}"].inv.sum()),
+                    "median ΔP lye ก่อนตัด": round(before, 3), "หลังตัด": round(after, 3)})
+    st.dataframe(pd.DataFrame(eff), hide_index=True, use_container_width=True)
+
+# ============================================================
+# เพิ่มเติมในแท็บ 2: ΔP
+# ============================================================
+with tab2:
+    st.markdown("#### ความดันตกคร่อม ΔP (แบบจำลองสมมติ)")
+    kp = st.number_input("ความไวของ ΔP ต่อ fouling (kp)", 0.0, 5.0, 1.0, 0.1, key="kp",
+                         help="ΔP ถูกคูณด้วย (1 + kp × fouling%) — ปรับได้เมื่อมีข้อมูลช่วงล้างเครื่องจริง")
+    sp = m["scored"]
+    dpl0, dpw0 = float(sp.dP_l.median()), float(sp.dP_w.median())
+    fr_ = 1 + kp * loss / 100
+    dpl, dpw = dpl0 * (vl / vl0) ** 1.8 * fr_, dpw0 * (vw / vw0) ** 1.8 * fr_
+    p1, p2 = st.columns(2)
+    p1.metric("ΔP ฝั่ง lye", f"{dpl:.2f} kg/cm²", f"{dpl - dpl0:+.2f} เทียบปกติ", delta_color="inverse")
+    p2.metric("ΔP ฝั่งน้ำ", f"{dpw:.2f} kg/cm²", f"{dpw - dpw0:+.2f} เทียบปกติ", delta_color="inverse")
+    st.caption("สมมติ ΔP ∝ flow^1.8 (ไหลปั่นป่วน) และเพิ่มตาม fouling; ค่าปกติใช้ median จากข้อมูลจริง")
+
+# ============================================================
+# แท็บ 4: Fouling Lab
+# ============================================================
+with tab4:
+    st.subheader("Fouling Lab: ข้อมูลสังเคราะห์, Fault Injection, RUL, เศรษฐศาสตร์")
+    st.warning("ส่วนนี้ใช้ข้อมูลสังเคราะห์จากแบบจำลองฟิสิกส์ + อุณหภูมิขาเข้าจริงที่สุ่มซ้ำ — "
+               "ไม่ใช่ข้อมูล fouling จริงของโรงงาน ต้องระบุเช่นนี้ในรายงาน")
+    c1, c2, c3, c4 = st.columns(4)
+    lab_phe = c1.radio("เครื่อง", PHES, key="lab_phe", horizontal=True)
+    days = c2.slider("ระยะเวลา (วัน)", 20, 120, 60, key="lab_days")
+    linf = c3.slider("UA ลดลงสูงสุด (%)", 10, 70, 40, key="lab_linf")
+    tau = c4.slider("ค่าคงที่เวลา τ (วัน)", 5, 60, 25, key="lab_tau")
+    ml, sl = M[lab_phe], M[lab_phe]["scored"]
+    r_ = np.random.default_rng(1)
+    n = days * 12
+    idx = r_.integers(0, len(sl), n)
+    t = np.arange(n) / 12
+    loss_t = linf / 100 * (1 - np.exp(-t / tau))
+    thi, tci = sl.th_i.values[idx], sl.tc_i.values[idx]
+    tho, tco = predict(thi, tci, ml["ua_med"] * (1 - loss_t), vl0, vw0)[:2]
+    tho = np.round(tho + r_.normal(0, .3, n))
+    tco = np.round(tco + r_.normal(0, .3, n))
+    cc = calc(thi, tho, tci, tco, vl0, vw0)
+    syn = pd.DataFrame({"t": t, "UA": cc["UA"], "th_o": tho})
+    syn["HI"] = syn.UA.rolling(24, min_periods=12).median() / ml["ua_med"]
+    syn["HI_true"] = 1 - loss_t
+    kp_ = st.session_state.get("kp", 1.0)
+    dpl_t = float(sl.dP_l.median()) * (1 + kp_ * loss_t)
+
+    def first_day(cond):
+        cond = np.asarray(cond)
+        return float(t[np.argmax(cond)]) if cond.any() else None
+
+    w_det, w_true = first_day(syn.HI.values < 0.85), first_day(syn.HI_true.values < 0.85)
+    c_det, c_true = first_day(syn.HI.values < 0.70), first_day(syn.HI_true.values < 0.70)
+    fmt = lambda v: "ไม่ถึงเกณฑ์" if v is None else f"วันที่ {v:.1f}"
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("เตือน (HI < 85%) — AI ตรวจพบ", fmt(w_det))
+    k2.metric("เตือน — จริง", fmt(w_true))
+    k3.metric("ควรล้าง (HI < 70%) — AI ตรวจพบ", fmt(c_det))
+    k4.metric("ควรล้าง — จริง", fmt(c_true))
+    tail = syn.dropna(subset=["HI"]).tail(84)
+    if len(tail) > 10:
+        sl_, ic_ = np.polyfit(tail.t, tail.HI, 1)
+        rul = (0.70 - ic_) / sl_ if sl_ < 0 else None
+        st.caption("RUL แบบเส้นตรงจาก 7 วันล่าสุด: " + (f"HI ถึง 70% ราววันที่ {rul:.0f} (เหลืออีก ~{max(rul - days, 0):.0f} วัน)"
+                   if rul else "ยังไม่มีแนวโน้มลดลง") + " — เส้นตรงอาจประเมินสูงเกินไปเมื่อ fouling เข้าใกล้ค่าอิ่มตัว")
+
+    g1, g2 = st.columns(2)
+    f1 = go.Figure()
+    f1.add_scatter(x=syn.t, y=syn.HI, name="HI ที่ AI วัดได้ (median 2 วัน)")
+    f1.add_scatter(x=syn.t, y=syn.HI_true, name="HI จริงในแบบจำลอง", line_dash="dash")
+    f1.add_hline(y=0.85, line_dash="dot", annotation_text="เตือน")
+    f1.add_hline(y=0.70, line_dash="dot", annotation_text="ล้าง")
+    f1.update_layout(xaxis_title="วัน", yaxis_title="Health Index", height=360)
+    g1.plotly_chart(f1, use_container_width=True)
+    f2 = go.Figure()
+    f2.add_scatter(x=t, y=pd.Series(tho).rolling(24, min_periods=6).mean(), name="Lye outlet (°C)")
+    f2.add_scatter(x=t, y=dpl_t, name="ΔP lye (kg/cm²)", yaxis="y2")
+    f2.update_layout(xaxis_title="วัน", yaxis_title="Lye outlet (°C)", height=360,
+                     yaxis2=dict(title="ΔP (kg/cm²)", overlaying="y", side="right"))
+    g2.plotly_chart(f2, use_container_width=True)
+
+    st.markdown("#### Fault injection: ตรวจจับได้กี่ % ที่ระดับ fouling ต่างๆ")
+    r2_ = np.random.default_rng(2)
+    rows = []
+    for sv_ in (0, 5, 10, 20, 30, 50):
+        det = detect(inject(sl, sv_ / 100, vl0, vw0, ml["ua_med"], r2_), ml)
+        rows.append({"UA ลดลง (%)": sv_, **{k: round(100 * float(np.mean(v)), 1) for k, v in det.items()}})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    real_det = detect(sl, ml)
+    fa = pd.DataFrame({"False alarm บนข้อมูลจริง (ครั้ง/สัปดาห์)": {k: round(float(np.sum(v)) / (len(sl) / 84), 1) for k, v in real_det.items()}})
+    st.dataframe(fa, use_container_width=True)
+    st.caption("ค่าในตารางคือ % ของจุดข้อมูลที่ถูกเตือน แถว 0% = false alarm บนข้อมูลสังเคราะห์ที่เครื่องปกติ "
+               "(1 สัปดาห์ ≈ 84 จุด) — ใช้เทียบวิธีว่าวิธีไหนไวและเตือนผิดน้อยกว่า")
+
+    st.markdown("#### เศรษฐศาสตร์การล้างเครื่อง (ตัวเลขต้นทุนเป็นค่าสมมติ ปรับได้)")
+    e1, e2 = st.columns(2)
+    c_clean = e1.number_input("ค่าล้างต่อครั้ง รวมเสียโอกาส (บาท)", 0.0, 1e7, 20000.0, 1000.0, key="c_clean")
+    pen = e2.number_input("ต้นทุนความร้อนที่ระบายไม่ได้ (บาท/kWh)", 0.0, 100.0, 1.5, 0.1, key="pen")
+    Td, dd = np.arange(5, 181), np.arange(0, 181)
+    thm, tcm = float(sl.th_i.median()), float(sl.tc_i.median())
+    q_clean = predict(thm, tcm, ml["ua_med"], vl0, vw0)[2]
+    q_d = predict(thm, tcm, ml["ua_med"] * (1 - linf / 100 * (1 - np.exp(-dd / tau))), vl0, vw0)[2]
+    cum = np.cumsum((q_clean - q_d) * 24 * pen)
+    avg = (c_clean + cum[Td - 1]) / Td
+    T_opt = int(Td[int(np.argmin(avg))])
+    fe = go.Figure(go.Scatter(x=Td, y=avg, mode="lines", name="ต้นทุนเฉลี่ย/วัน"))
+    fe.add_scatter(x=[T_opt], y=[float(avg.min())], mode="markers", marker_size=12, name="จุดคุ้มที่สุด")
+    fe.update_layout(xaxis_title="รอบการล้าง (วัน)", yaxis_title="บาท/วัน", height=340)
+    st.plotly_chart(fe, use_container_width=True)
+    st.success(f"รอบล้างที่คุ้มที่สุดตามสมมติฐานนี้: ~{T_opt} วัน (ต้นทุนเฉลี่ย {avg.min():,.0f} บาท/วัน)")
+    st.caption("ถ้าจุดต่ำสุดอยู่ที่ขอบ 180 วัน แปลว่าที่ fouling/ต้นทุนนี้ การล้างไม่คุ้ม — ผลขึ้นกับสมมติฐานทั้งหมดข้างบน")
+
+# ============================================================
+# แท็บ 5: Flow Sensitivity
+# ============================================================
+with tab5:
+    st.subheader("Flow Sensitivity: เมื่อไม่มีอัตราการไหลจริง")
+    st.markdown("#### 1) ประมาณ flow น้ำย้อนกลับจากสมดุลความร้อน (ให้ Lye flow ฐานเป็นหลัก)")
+    est, er = {}, []
+    for p in PHES:
+        sp_ = M[p]["scored"]
+        dtl, dtw = float((sp_.th_i - sp_.th_o).median()), float((sp_.tc_o - sp_.tc_i).median())
+        est[p] = vl0 * RHO_L * CP_L * dtl / (RHO_W * CP_W * dtw) if dtw > 0 else np.nan
+        er.append({"เครื่อง": p, "ΔT lye (°C)": round(dtl, 2), "ΔT น้ำ (°C)": round(dtw, 2),
+                   f"Water flow ที่ทำให้สมดุล (m³/hr) เมื่อ Lye = {vl0}": round(est[p], 2)})
+    st.dataframe(pd.DataFrame(er), hide_index=True, use_container_width=True)
+    st.session_state["_vw_est"] = float(np.nanmean(list(est.values())))
+    st.code("V_water / V_lye = (ρ_lye × Cp_lye × ΔT_lye) / (ρ_water × Cp_water × ΔT_water)", language="text")
+    st.button("ใช้ค่าเฉลี่ยของสองเครื่องเป็น Cooling water flow ฐาน", on_click=cb_use_est)
+    st.caption("เป็นการประมาณ: สมมติไม่มีความร้อนสูญเสีย และขึ้นกับ Lye flow ที่สมมติ — ใช้ตรวจความสอดคล้องเท่านั้น")
+
+    st.markdown("#### 2) ข้อสรุปเปลี่ยนไหมเมื่อ flow เปลี่ยน")
+    st.caption("การคูณ Lye flow ครอบคลุมความไม่แน่นอนของ ρ และ Cp ของ lye ด้วย (Cl = V × ρ × Cp) เช่น ±5% = แถว 0.95 / 1.05")
+    sens = sens_table(raw, vl0, vw0)
+    n_eps = int((sens["ε PHE#1"] > sens["ε PHE#2"]).sum())
+    n_foul = int((((sens["p PHE#1"] < .05) & (sens["แนวโน้ม UA PHE#1 (%/วัน)"] < 0)) |
+                  ((sens["p PHE#2"] < .05) & (sens["แนวโน้ม UA PHE#2 (%/วัน)"] < 0))).sum())
+    s1, s2 = st.columns(2)
+    s1.metric("ε ของ PHE#1 > PHE#2", f"{n_eps}/{len(sens)} กรณี")
+    s2.metric("พบแนวโน้ม fouling", f"{n_foul}/{len(sens)} กรณี")
+    fs_ = px.line(sens[sens["Water flow ×"] == 1.0], x="Lye flow ×", y=["UA PHE#1", "UA PHE#2"], markers=True)
+    fs_.update_layout(yaxis_title="UA เฉลี่ย (W/K)", height=320)
+    st.plotly_chart(fs_, use_container_width=True)
+    with st.expander("ดูตารางทุกกรณี"):
+        st.dataframe(sens, hide_index=True, use_container_width=True)
+
+    st.markdown("#### 3) Counter-flow เทียบ Parallel-flow")
+    pr = []
+    for p in PHES:
+        sp_ = D[D.phe == p].dropna(subset=["Ql"])
+        d1, d2 = (sp_.th_i - sp_.tc_i).values, (sp_.th_o - sp_.tc_o).values
+        with np.errstate(all="ignore"):
+            lp = np.where((d1 > 0) & (d2 > 0) & (np.abs(d1 - d2) > 1e-6), (d1 - d2) / np.log(d1 / d2), np.nan)
+        uap = np.nanmedian(sp_.Ql.values * 1000 / lp)
+        pr.append({"เครื่อง": p, "UA counter-flow (W/K)": round(float(sp_.UA.median())),
+                   "UA parallel-flow (W/K)": round(float(uap)), "อัตราส่วน": round(float(uap / sp_.UA.median()), 2)})
+    st.dataframe(pd.DataFrame(pr), hide_index=True, use_container_width=True)
+    st.caption("ถ้า PHE จริงเป็น counter-flow เกือบสมบูรณ์ (ปกติของ plate exchanger) ใช้ค่า counter-flow ได้ "
+               "ส่วนอัตราส่วนบอกว่าสมมติฐานนี้เปลี่ยน UA มากแค่ไหน — แต่แนวโน้มเชิงเวลาไม่ขึ้นกับตรงนี้")
+
+    st.markdown("#### 4) เปรียบเทียบ PHE#1 กับ PHE#2 ที่เงื่อนไขเดียวกัน (Lye 40 °C, น้ำ 30 °C)")
+    cr = []
+    for p in PHES:
+        o = predict(40.0, 30.0, M[p]["ua_med"], vl0, vw0)
+        cr.append({"เครื่อง": p, "UA (W/K)": round(M[p]["ua_med"]), "ε": round(float(o[3]), 3),
+                   "Lye outlet (°C)": round(float(o[0]), 2), "Q (kW)": round(float(o[2]), 1)})
+    st.dataframe(pd.DataFrame(cr), hide_index=True, use_container_width=True)
+    st.caption("PHE#2 รับ lye ร้อนกว่า จึงเทียบ ΔT ตรงๆ ไม่ได้ — ตารางนี้ปรับเงื่อนไขให้เท่ากันก่อน")
+
+    st.markdown("#### 5) Fouling resistance (Rf) — ต้องการข้อมูลจาก datasheet")
+    if st.session_state.get("A_hx", 0) > 0 and st.session_state.get("U_clean", 0) > 0:
+        rr = []
+        for p in PHES:
+            U = M[p]["ua_med"] / st.session_state.A_hx
+            rr.append({"เครื่อง": p, "U (W/m²K)": round(U, 1),
+                       "Rf (m²K/W)": f"{1 / U - 1 / st.session_state.U_clean:.5f}"})
+        st.dataframe(pd.DataFrame(rr), hide_index=True, use_container_width=True)
+        st.code("U = UA / A\nRf = 1/U_fouled − 1/U_clean", language="text")
+    else:
+        st.info("กรอกพื้นที่ A และ U_clean ในแถบด้านซ้าย (กล่อง 'ข้อมูล datasheet') เมื่อมีข้อมูล ระบบจะคำนวณ Rf ให้ — "
+                "ตอนนี้ใช้ Health Index = UA / UA_baseline เป็นตัวแทน")
+
+# ============================================================
+# แท็บ 6: โมเดล ข้อจำกัด และ Roadmap
+# ============================================================
+with tab6:
+    st.subheader("Workflow")
+    st.graphviz_chart('digraph { rankdir=LR; node [shape=box, style=rounded]; '
+                      'A [label="Plant data (Excel)"]; B [label="Clean + QC"]; C [label="ฟิสิกส์: ε-NTU, UA, LMTD"]; '
+                      'D [label="AI: RF / Hybrid / Isolation Forest"]; E [label="Simulator"]; F [label="Diagnostics + Fouling Lab"]; '
+                      'A -> B -> C -> D; C -> E; D -> F; E -> F; }')
+    st.subheader("สูตรหลักของแบบจำลอง")
+    st.code("\n".join([
+        "Cl = V_lye / 3600 × ρ_lye × Cp_lye",
+        "Cw = V_water / 3600 × ρ_water × Cp_water",
+        "Cmin = min(Cl, Cw)",
+        "Cr = Cmin / Cmax",
+        "NTU = UA / Cmin",
+        "ε = (1 − exp(−NTU × (1 − Cr))) / (1 − Cr × exp(−NTU × (1 − Cr)))",
+        "Q = ε × Cmin × (Th,in − Tc,in)",
+        "Th,out = Th,in − Q / Cl",
+        "Tc,out = Tc,in + Q / Cw",
+        "UA = Q_lye / LMTD",
+        "Health Index = UA / UA_baseline",
+    ]), language="text")
+    st.subheader("ข้อจำกัด (Limitations)")
+    st.markdown("""
+- ข้อมูลจริงเพียง ~14 วัน และเครื่องยังปกติ AI จึงเรียนรู้ "ลักษณะปกติ" ได้เท่านั้น
+- อัตราการไหลเป็นค่าสมมติ ผลสัมบูรณ์ (kW, W/K) เป็นค่าประมาณ แต่ผลเชิงเปรียบเทียบและแนวโน้มทดสอบแล้วในแท็บ Flow Sensitivity
+- ข้อมูลอ่านมือละเอียด 1 °C ทำให้ UA รายจุดไม่แน่นอนหลายสิบเปอร์เซ็นต์
+- ไม่มี datasheet (พื้นที่, U_clean) จึงคำนวณ Rf จริงไม่ได้
+- ข้อมูลไม่มีสถานะการเดินเครื่อง (load, start/stop) จึงแยก "ผิดปกติ" ออกจาก "เปลี่ยนโหลด" ไม่ได้
+- ข้อมูลช่วง fouling ในแท็บ Fouling Lab เป็นข้อมูลสังเคราะห์ ไม่ใช่ข้อมูลจริง
+- ΔP ในตัวจำลองและต้นทุนการล้างเป็นแบบจำลอง/ค่าสมมติที่ปรับได้
+- เวอร์ชันนี้เป็น offline data-driven twin ยังไม่เชื่อม real-time
+""")
+    st.subheader("คำถามที่คาดว่าจะโดน")
+    for q_, a_ in [
+        ("ทำไมใช้ AI ทั้งที่มีสมการอยู่แล้ว?", "ฟิสิกส์ให้ค่าที่ควรเป็น AI เรียนรู้ความเบี่ยงเบนและความผิดปกติหลายตัวแปรพร้อมกัน และ Hybrid รวมสองอย่างเข้าด้วยกัน"),
+        ("ข้อมูลน้อยเกินไปไหม?", "ใช่ จึงประเมินด้วย time-series CV, ใช้ข้อมูลสังเคราะห์ทดสอบการตรวจจับ และเสนอให้เก็บข้อมูลต่อจนถึงวันล้างเครื่อง"),
+        ("เอาไปใช้จริงได้ไหม?", "ระดับต้นแบบ ต้องมี flow จริง datasheet และข้อมูลช่วงล้างเครื่องก่อน"),
+        ("ตรวจเจอ fouling จริงไหม?", "ในข้อมูลจริงยังไม่พบแนวโน้ม ซึ่งสอดคล้องกับรอบล้างราว 2 เดือนที่ supervisor ยืนยัน"),
+    ]:
+        with st.expander(q_):
+            st.write(a_)
+    st.subheader("Roadmap")
+    st.markdown("""
+1. เก็บข้อมูลต่อเนื่องถึงวันล้างเครื่อง แล้วอัปโหลดหลายไฟล์พร้อมกัน (ระบบรวมและเทรนใหม่ให้)
+2. ขอ flow จริงและ datasheet เพื่อคำนวณ Rf
+3. เพิ่มคอลัมน์สถานะการเดินเครื่องในการบันทึก
+4. เชื่อม sensor / PLC / historian (OPC-UA, MQTT) เพื่อเป็น twin แบบ real-time
+""")
