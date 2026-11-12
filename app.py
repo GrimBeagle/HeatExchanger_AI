@@ -8,11 +8,12 @@ import plotly.express as px
 import streamlit as st
 from scipy.stats import linregress
 import warnings
-from sklearn.ensemble import GradientBoostingRegressor, IsolationForest, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor, IsolationForest, RandomForestClassifier, RandomForestRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.linear_model import Ridge
-from sklearn.metrics import r2_score
+from sklearn.metrics import accuracy_score, confusion_matrix, r2_score
+from sklearn.model_selection import KFold, cross_val_predict, train_test_split
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -245,6 +246,83 @@ def cb_use_est():
         st.session_state.vw0, st.session_state.vw = v, v
 
 
+CLASSES = ["Normal", "Fouling", "Lye flow drop", "Water flow drop", "Warm cooling water", "Hot lye surge"]
+CF = ["dth", "dtc", "resid_l", "resid_w"]
+
+
+def predict_v(th_i, tc_i, ua, vl, vw):
+    """ε-NTU แบบ vectorized (รองรับ flow/UA เป็นอาร์เรย์) — ใช้สร้างข้อมูลสังเคราะห์"""
+    cl, cw = caps(vl, vw)
+    cmin, cmax = np.minimum(cl, cw), np.maximum(cl, cw)
+    cr, ntu = cmin / cmax, ua / cmin
+    e = np.exp(-ntu * (1 - cr))
+    with np.errstate(all="ignore"):
+        eps = np.where(np.abs(1 - cr) < 1e-9, ntu / (1 + ntu), (1 - e) / (1 - cr * e))
+    q = eps * cmin * (th_i - tc_i)
+    return th_i - q / cl, tc_i + q / cw
+
+
+def decide(clf, X, thr=0.6):
+    """จัดเป็นความผิดปกติเฉพาะเมื่อมั่นใจ ≥ thr มิฉะนั้นถือเป็น Normal (ลด false alarm)"""
+    pr = clf.predict_proba(X)
+    lab = clf.classes_[pr.argmax(1)].astype(object)
+    lab[(lab != "Normal") & (pr.max(1) < thr)] = "Normal"
+    return lab, pr
+
+
+def synth_faults(s, ua_med, vl, vw, base, sig_l, sig_w, n_per, seed=0):
+    """สร้างข้อมูลสังเคราะห์ 6 คลาส: ใช้อุณหภูมิขาเข้าจริงสุ่มซ้ำ + ฟิสิกส์ + noise เท่าที่เห็นในข้อมูลจริง"""
+    r = np.random.default_rng(seed)
+    out = []
+    for cname in CLASSES:
+        idx = r.integers(0, len(s), n_per)
+        thi, tci = s.th_i.values[idx].astype(float), s.tc_i.values[idx].astype(float)
+        ua, fl, fw = np.full(n_per, ua_med), np.full(n_per, vl), np.full(n_per, vw)
+        sev = np.full(n_per, np.nan)
+        if cname == "Fouling":
+            sev = r.uniform(.15, .6, n_per)
+            ua = ua_med * (1 - sev)
+        elif cname == "Lye flow drop":
+            fl = vl * r.uniform(.4, .8, n_per)
+        elif cname == "Water flow drop":
+            fw = vw * r.uniform(.4, .8, n_per)
+        elif cname == "Warm cooling water":
+            tci = tci + r.uniform(3, 8, n_per)
+        elif cname == "Hot lye surge":
+            thi = thi + r.uniform(3, 8, n_per)
+        tho_f, tco_f = predict_v(thi, tci, ua, fl, fw)
+        tho_h, tco_h = predict_v(thi, tci, ua_med, vl, vw)
+        out.append(pd.DataFrame({
+            "cls": cname, "sev": sev, "dth": thi - base[0], "dtc": tci - base[1],
+            "resid_l": tho_f - tho_h + r.normal(0, sig_l, n_per),
+            "resid_w": tco_f - tco_h + r.normal(0, sig_w, n_per)}))
+    return pd.concat(out, ignore_index=True)
+
+
+@st.cache_data(show_spinner="กำลังเทรน Fault Classifier...")
+def build_clf(s: pd.DataFrame, ua_med: float, vl: float, vw: float) -> dict:
+    X = s[["th_i", "tc_i"]].values
+    kf = KFold(5)
+    rl = s.th_o.values - cross_val_predict(_ml("RandomForest"), X, s.th_o.values, cv=kf)
+    rw = s.tc_o.values - cross_val_predict(_ml("RandomForest"), X, s.tc_o.values, cv=kf)
+    sig_l, sig_w = max(float(rl.std()), .3), max(float(rw.std()), .3)
+    base = (float(s.th_i.median()), float(s.tc_i.median()))
+    syn = synth_faults(s, ua_med, vl, vw, base, sig_l, sig_w, 600)
+    Xtr, Xte, ytr, yte, _, ste = train_test_split(syn[CF], syn.cls, syn.sev, test_size=.3, stratify=syn.cls, random_state=0)
+    clf = RandomForestClassifier(300, min_samples_leaf=3, random_state=0).fit(Xtr, ytr)
+    pred = decide(clf, Xte)[0]
+    cm = pd.DataFrame(confusion_matrix(yte, pred, labels=CLASSES), index=CLASSES, columns=CLASSES)
+    rec = []
+    for lo, hi in [(.15, .2), (.2, .3), (.3, .4), (.4, .5), (.5, .61)]:
+        mk = ((yte == "Fouling") & (ste >= lo) & (ste < hi)).values
+        rec.append({"UA ลดลง (%)": f"{lo * 100:.0f}–{min(hi, .6) * 100:.0f}", "Recall ของ Fouling (%)": round(100 * float(np.mean(pred[mk] == "Fouling")), 1)})
+    real = pd.DataFrame({"dth": s.th_i.values - base[0], "dtc": s.tc_i.values - base[1], "resid_l": rl, "resid_w": rw})
+    rp = decide(clf, real[CF])[0]
+    dist = (pd.Series(rp).value_counts(normalize=True).reindex(CLASSES).fillna(0) * 100).round(1)
+    return dict(clf=clf, cm=cm, acc=float(accuracy_score(yte, pred)), rec=pd.DataFrame(rec), dist=dist,
+                base=base, sig=(sig_l, sig_w), real_pred=rp, imp=dict(zip(CF, clf.feature_importances_.round(3))))
+
+
 # ============================================================
 # Sidebar: แหล่งข้อมูล
 # ============================================================
@@ -366,8 +444,8 @@ iso_flag = bool(m["iso"].predict(feat)[0] == -1)
 ua_ratio = float(c["UA"]) / m["ua_med"]
 inside = all(m["rng"][k][0] - 0.5 <= v <= m["rng"][k][1] + 0.5 for k, v in (("th_i", th), ("tc_i", tc)))
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["1️⃣ Plant Data & AI Baseline", "2️⃣ Interactive Simulator", "3️⃣ AI Diagnostics",
-                                              "4️⃣ Fouling Lab", "5️⃣ Flow Sensitivity", "6️⃣ Model & Limitations"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["1️⃣ Plant Data & AI Baseline", "2️⃣ Interactive Simulator", "3️⃣ AI Diagnostics",
+                                              "4️⃣ Fouling Lab", "5️⃣ Flow Sensitivity", "6️⃣ Model & Limitations", "7️⃣ Fault Classifier"])
 
 # ------------------------------------------------------------
 with tab1:
@@ -762,7 +840,7 @@ with tab6:
 - ข้อมูลอ่านมือละเอียด 1 °C ทำให้ UA รายจุดไม่แน่นอนหลายสิบเปอร์เซ็นต์
 - ไม่มี datasheet (พื้นที่, U_clean) จึงคำนวณ Rf จริงไม่ได้
 - ข้อมูลไม่มีสถานะการเดินเครื่อง (load, start/stop) จึงแยก "ผิดปกติ" ออกจาก "เปลี่ยนโหลด" ไม่ได้
-- ข้อมูลช่วง fouling ในแท็บ Fouling Lab เป็นข้อมูลสังเคราะห์ ไม่ใช่ข้อมูลจริง
+- ข้อมูลช่วง fouling ในแท็บ Fouling Lab และ Fault Classifier เป็นข้อมูลสังเคราะห์ ไม่ใช่ข้อมูลจริง (simulation-to-real ยังไม่ได้ยืนยัน)
 - ΔP ในตัวจำลองและต้นทุนการล้างเป็นแบบจำลอง/ค่าสมมติที่ปรับได้
 - เวอร์ชันนี้เป็น offline data-driven twin ยังไม่เชื่อม real-time
 """)
@@ -782,3 +860,47 @@ with tab6:
 3. เพิ่มคอลัมน์สถานะการเดินเครื่องในการบันทึก
 4. เชื่อม sensor / PLC / historian (OPC-UA, MQTT) เพื่อเป็น twin แบบ real-time
 """)
+
+
+# ============================================================
+# แท็บ 7: Fault Classifier (supervised จากข้อมูลสังเคราะห์)
+# ============================================================
+with tab7:
+    st.subheader(f"Fault Classifier — {phe}")
+    st.warning("โมเดลนี้เรียนรู้จาก **ข้อมูลสังเคราะห์** (ฟิสิกส์ + อุณหภูมิขาเข้าจริง + noise ระดับเดียวกับข้อมูลจริง) "
+               "เพราะข้อมูลจริงไม่มีตัวอย่างความผิดปกติ — ความแม่นยำด้านล่างวัดบนข้อมูลสังเคราะห์ ยังไม่ได้ยืนยันกับเครื่องจริง")
+    cl_ = build_clf(M[phe]["scored"], M[phe]["ua_med"], vl0, vw0)
+    z1, z2, z3 = st.columns(3)
+    z1.metric("Accuracy (ข้อมูลสังเคราะห์ที่ไม่เคยเห็น)", f"{cl_['acc'] * 100:.1f} %")
+    z2.metric("ข้อมูลจริงที่ถูกจัดเป็น Normal", f"{cl_['dist']['Normal']:.1f} %")
+    z3.metric("Noise ที่ใช้ (σ lye / σ น้ำ)", f"{cl_['sig'][0]:.2f} / {cl_['sig'][1]:.2f} °C")
+
+    st.markdown("#### สถานะที่ตั้งไว้ในตัวจำลอง (แท็บ 2) ถูกจัดเป็นอะไร")
+    sim_x = pd.DataFrame([[th - cl_["base"][0], tc - cl_["base"][1], th_o - b_tho, tc_o - b_tco]], columns=CF)
+    lab_, pp_ = decide(cl_["clf"], sim_x)
+    pr_ = pd.Series(pp_[0], index=cl_["clf"].classes_).reindex(CLASSES) * 100
+    st.success(f"ผลจัดประเภท: **{lab_[0]}** (ความน่าจะเป็นสูงสุด {pr_.max():.0f}%; ถือเป็นความผิดปกติเมื่อ ≥ 60%)")
+    fp = px.bar(pr_.round(1).reset_index().rename(columns={"index": "ประเภท", 0: "ความน่าจะเป็น (%)"}),
+                x="ประเภท", y="ความน่าจะเป็น (%)")
+    fp.update_layout(height=300)
+    st.plotly_chart(fp, use_container_width=True)
+    st.caption("ลองเลือก preset ในแถบด้านซ้าย (เช่น Lye Flow Drop) แล้วดูว่าโมเดลแยกอาการได้หรือไม่")
+
+    g1, g2 = st.columns(2)
+    fc = px.imshow(cl_["cm"], text_auto=True, aspect="auto", labels=dict(x="ทำนาย", y="จริง", color="จำนวน"))
+    fc.update_layout(height=420, title="Confusion matrix (ข้อมูลสังเคราะห์ชุดทดสอบ)")
+    g1.plotly_chart(fc, use_container_width=True)
+    g2.markdown("**Recall ของ Fouling ตามความรุนแรง**")
+    g2.dataframe(cl_["rec"], hide_index=True, use_container_width=True)
+    g2.markdown("**ความสำคัญของ feature**")
+    g2.dataframe(pd.DataFrame({"importance": cl_["imp"]}), use_container_width=True)
+
+    st.markdown("#### ข้อมูลจริงถูกจัดเป็นอะไรบ้าง (ควรเป็น Normal เป็นส่วนใหญ่)")
+    ss_ = M[phe]["scored"]
+    fr_ = px.scatter(pd.DataFrame({"Time": ss_.Time, "ประเภท": cl_["real_pred"]}), x="Time", y="ประเภท",
+                     category_orders={"ประเภท": CLASSES})
+    fr_.update_layout(height=320)
+    st.plotly_chart(fr_, use_container_width=True)
+    st.dataframe(cl_["dist"].rename("% ของข้อมูลจริง").to_frame(), use_container_width=True)
+    st.caption("ที่ถูกจัดเป็นความผิดปกติในข้อมูลจริง = false alarm ของ classifier (ข้อมูลจริงช่วงนี้ไม่มีเหตุการณ์ผิดปกติที่ยืนยันได้) "
+               "ใช้ cross-validation แบบแบ่งบล็อกเพื่อคำนวณความเบี่ยงเบนจากค่าปกติ")
