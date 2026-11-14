@@ -21,6 +21,15 @@ from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="AI-Based Heat Exchanger Digital Twin", page_icon="🌡️", layout="wide")
+st.markdown("""<style>
+.block-container{padding-top:1.6rem;}
+h1,h2,h3{color:#1E5C3A;}
+[data-testid="stMetric"]{background:#F4F8F5;border:1px solid #D5E3DA;border-radius:12px;padding:12px 14px;}
+[data-testid="stMetricValue"]{color:#1E5C3A;font-weight:700;}
+button[data-baseweb="tab"]{font-size:1.02rem;font-weight:600;padding:10px 14px;}
+[data-testid="stSidebar"]{background:#F4F8F5;}
+[data-testid="stExpander"]{border-radius:10px;border:1px solid #D5E3DA;}
+</style>""", unsafe_allow_html=True)
 
 RHO_L, CP_L, RHO_W, CP_W = 1450.0, 3200.0, 996.0, 4180.0  # NaOH 43% / น้ำหล่อเย็น
 DEFAULT_FILE = "PHE_Performance_Analysis_v3.xlsx"           # วางไว้ใน repo เพื่อโหลดอัตโนมัติ
@@ -331,7 +340,7 @@ st.title("🌡️ AI-Based Heat Exchanger Digital Twin")
 st.caption("Digitalization in Chemical Engineering — Caustic Absorption Plant (PHE#1 / PHE#2, Lye 43% NaOH ↔ Cooling Water)")
 
 with st.sidebar:
-    st.header("📁 แหล่งข้อมูล")
+    st.header("① 📁 แหล่งข้อมูล")
     ups = st.file_uploader("อัปโหลดไฟล์ PHE_Performance_Analysis (.xlsx) — เลือกได้หลายไฟล์ ระบบจะรวมให้", type=["xlsx"],
                            accept_multiple_files=True)  # ต้องอัปโหลดก่อนจึงจะแสดงผล
     with st.expander("⚠️ อัตราการไหลฐาน (ค่าสมมติ)"):
@@ -342,8 +351,13 @@ with st.sidebar:
         st.number_input("พื้นที่แลกเปลี่ยนความร้อน A (m²) — 0 = ไม่ทราบ", 0.0, 10000.0, 0.0, 1.0, key="A_hx")
         st.number_input("U_clean (W/m²K) — 0 = ไม่ทราบ", 0.0, 10000.0, 0.0, 10.0, key="U_clean")
 
+with st.expander("📖 วิธีใช้งานแบบเร็ว (4 ขั้น)", expanded=not ups):
+    st.markdown("1. **อัปโหลดไฟล์ Excel** ที่แถบด้านซ้าย (ต้องอัปโหลดก่อนจึงจะแสดงผล)\n"
+                "2. เปิดแท็บ **🏠 ภาพรวม** ดูไฟจราจรว่าเครื่องไหนปกติหรือเริ่มมีปัญหา\n"
+                "3. เลือกเครื่องและสถานการณ์ที่แถบด้านซ้าย แล้วดูผลในแท็บ **🎛️ ตัวจำลอง** และ **🩺 วินิจฉัย AI**\n"
+                "4. อยากดูว่าระบบเตือน fouling ได้เร็วแค่ไหน ให้กด **▶ เริ่ม Demo** ในแท็บภาพรวม")
 if not ups:
-    st.info("👈 กรุณาอัปโหลดไฟล์ข้อมูล Plant Data (.xlsx) ที่แถบด้านซ้ายก่อน ระบบจึงจะวิเคราะห์และเปิดตัวจำลองครับ")
+    st.info("👈 เริ่มที่แถบด้านซ้าย: อัปโหลดไฟล์ Plant Data (.xlsx) ระบบจะวิเคราะห์และเปิดทุกแท็บให้ทันที")
     st.stop()
 try:
     raw = (pd.concat([load_plant(u.getvalue()) for u in ups]).drop_duplicates("Time")
@@ -405,7 +419,7 @@ for k, (lo, hi) in RNG.items():
     st.session_state[k] = float(np.clip(st.session_state.get(k, DEF[k]), lo, hi))
 
 with st.sidebar:
-    st.header("⚙️ Simulator Controls")
+    st.header("② ⚙️ ตัวควบคุมการจำลอง")
     phe = st.radio("เครื่องที่ต้องการจำลอง", PHES, key="phe", horizontal=True, on_change=cb_reset)
     st.selectbox("Fault Scenario (preset)", list(SCEN), key="scen", on_change=cb_scen,
                  help="เลือกแล้วระบบจะตั้งค่าทุกตัวให้ จากนั้นยังปรับละเอียดเองต่อได้")
@@ -445,12 +459,13 @@ iso_flag = bool(m["iso"].predict(feat)[0] == -1)
 ua_ratio = float(c["UA"]) / m["ua_med"]
 inside = all(m["rng"][k][0] - 0.5 <= v <= m["rng"][k][1] + 0.5 for k, v in (("th_i", th), ("tc_i", tc)))
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["🏠 Overview", "1️⃣ Plant Data & AI Baseline", "2️⃣ Interactive Simulator", "3️⃣ AI Diagnostics",
-                                              "4️⃣ Fouling Lab", "5️⃣ Flow Sensitivity", "6️⃣ Model & Limitations", "7️⃣ Fault Classifier"])
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["🏠 ภาพรวม", "📊 ข้อมูลจริง", "🎛️ ตัวจำลอง", "🩺 วินิจฉัย AI", "🧪 Fouling Lab",
+                                                          "🔄 Flow Sensitivity", "📘 โมเดล & ข้อจำกัด", "🏷️ จำแนกความผิดปกติ"])
 
 # ------------------------------------------------------------
 with tab1:
     st.subheader("ข้อมูลจริงจากโรงงานและโมเดลที่เทรนจากข้อมูลนี้")
+    st.caption("ข้อมูลจริงบอกอะไร และโมเดล AI ที่เทรนจากข้อมูลนี้แม่นแค่ไหน")
     a, b, c3, d4 = st.columns(4)
     a.metric("จำนวนข้อมูลจริง", f"{len(raw)} แถว")
     b.metric("ช่วงเวลา", f"{raw.Time.min():%d %b} – {raw.Time.max():%d %b %Y}")
@@ -506,11 +521,12 @@ with tab1:
 # ------------------------------------------------------------
 with tab2:
     st.subheader(f"ผลการจำลอง — {phe}")
+    st.caption("ลองปรับค่าที่แถบด้านซ้าย แล้วดูว่าเครื่องตอบสนองอย่างไร (เทียบปกติ = เครื่องสะอาดที่สภาวะเดียวกัน)")
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Heat Duty", f"{q:.1f} kW", f"{q - b_q:+.1f} kW เทียบปกติ")
     k2.metric("Lye outlet", f"{th_o:.1f} °C", f"{th_o - b_tho:+.1f} °C เทียบปกติ", delta_color="inverse")
     k3.metric("Water outlet", f"{tc_o:.1f} °C", f"{tc_o - b_tco:+.1f} °C เทียบปกติ", delta_color="off")
-    k4.metric("Effectiveness ε", f"{eps:.3f}", f"{eps - b_eps:+.3f} เทียบปกติ")
+    k4.metric("Effectiveness ε", f"{eps:.3f}", f"{eps - b_eps:+.3f} เทียบปกติ", help="สัดส่วนความร้อนที่ถ่ายเทได้จริง เทียบกับที่เป็นไปได้สูงสุด (0–1)")
     k5.metric("UA จริงที่ใช้", f"{ua_sim:,.0f} W/K", f"{-loss:.0f}% จากค่าปกติ" if loss else "ปกติ", delta_color="inverse" if loss else "off")
     st.caption(f"\"เทียบปกติ\" = เครื่องสะอาด (UA เฉลี่ยจากข้อมูลจริง {m['ua_med']:,.0f} W/K) ที่อุณหภูมิขาเข้าเดียวกันและอัตราไหลฐาน")
     if not inside:
@@ -541,11 +557,12 @@ with tab2:
 # ------------------------------------------------------------
 with tab3:
     st.subheader("AI Diagnostics & Decision Support")
+    st.caption("ระบบตัดสินว่าสภาวะที่จำลองไว้ปกติหรือผิดปกติ พร้อมสาเหตุที่เป็นไปได้")
     health = float(np.clip(ua_ratio * 100, 0, 100))
     critical = ua_ratio < 0.6 or abs(z) > 4 or (iso_flag and abs(z) > 3)
     warning = ua_ratio < 0.85 or abs(z) > 2 or iso_flag
     h1, h2, h3, h4 = st.columns(4)
-    h1.metric("Health Index (UA เทียบปกติ)", f"{health:.0f} %")
+    h1.metric("Health Index (UA เทียบปกติ)", f"{health:.0f} %", help="100% = สะอาดเท่าปกติ ต่ำกว่า 85% เตือน ต่ำกว่า 70% ควรล้าง")
     h2.metric("Lye outlet เทียบที่ AI คาด", f"{th_o - exp_tho:+.2f} °C", f"{z:+.1f} σ", delta_color="off")
     h3.metric("Isolation Forest score", f"{iso_score:+.3f}", "ผิดปกติ" if iso_flag else "ปกติ", delta_color="inverse" if iso_flag else "off")
     h4.metric("ช่วงข้อมูลที่เคยเรียนรู้", "อยู่ในช่วง" if inside else "นอกช่วง", delta_color="off")
@@ -652,6 +669,7 @@ with tab2:
 # ============================================================
 with tab4:
     st.subheader("Fouling Lab: ข้อมูลสังเคราะห์, Fault Injection, RUL, เศรษฐศาสตร์")
+    st.caption("ทดสอบว่าถ้าเกิด fouling ระบบจะเตือนได้เร็วแค่ไหน (ข้อมูลสังเคราะห์)")
     st.warning("ส่วนนี้ใช้ข้อมูลสังเคราะห์จากแบบจำลองฟิสิกส์ + อุณหภูมิขาเข้าจริงที่สุ่มซ้ำ — "
                "ไม่ใช่ข้อมูล fouling จริงของโรงงาน ต้องระบุเช่นนี้ในรายงาน")
     c1, c2, c3, c4 = st.columns(4)
@@ -746,6 +764,7 @@ with tab4:
 # ============================================================
 with tab5:
     st.subheader("Flow Sensitivity: เมื่อไม่มีอัตราการไหลจริง")
+    st.caption("เพราะไม่มีค่า flow จริง จึงตรวจว่าข้อสรุปยังเหมือนเดิมไหมถ้า flow ผิดไป")
     st.markdown("#### 1) ประมาณ flow น้ำย้อนกลับจากสมดุลความร้อน (ให้ Lye flow ฐานเป็นหลัก)")
     est, er = {}, []
     for p in PHES:
@@ -815,6 +834,7 @@ with tab5:
 # แท็บ 6: โมเดล ข้อจำกัด และ Roadmap
 # ============================================================
 with tab6:
+    st.caption("สูตร ข้อจำกัด และแผนต่อยอดของโปรเจกต์")
     st.subheader("Workflow")
     st.graphviz_chart('digraph { rankdir=LR; node [shape=box, style=rounded]; '
                       'A [label="Plant data (Excel)"]; B [label="Clean + QC"]; C [label="ฟิสิกส์: ε-NTU, UA, LMTD"]; '
@@ -859,6 +879,7 @@ with tab6:
 # ============================================================
 with tab7:
     st.subheader(f"Fault Classifier — {phe}")
+    st.caption("แยกประเภทความผิดปกติว่าเป็น fouling, flow ลด หรืออุณหภูมิเปลี่ยน (เรียนจากข้อมูลสังเคราะห์)")
     st.warning("โมเดลนี้เรียนรู้จาก **ข้อมูลสังเคราะห์** (ฟิสิกส์ + อุณหภูมิขาเข้าจริง + noise ระดับเดียวกับข้อมูลจริง) "
                "เพราะข้อมูลจริงไม่มีตัวอย่างความผิดปกติ — ความแม่นยำด้านล่างวัดบนข้อมูลสังเคราะห์ ยังไม่ได้ยืนยันกับเครื่องจริง")
     cl_ = build_clf(M[phe]["scored"], M[phe]["ua_med"], vl0, vw0)
@@ -940,6 +961,7 @@ def make_syn(ml, sl, days, linf, tau, vl, vw, seed=1):
 
 with tab0:
     st.subheader("ภาพรวมสุขภาพเครื่องแลกเปลี่ยนความร้อน")
+    st.caption("ดูแค่หน้านี้ก็รู้ว่าเครื่องไหนปกติหรือเริ่มมีปัญหา")
     st.caption(f"คำนวณจากข้อมูลจริงถึง {raw.Time.max():%d %b %Y %H:%M} — เทียบ UA ล่าสุด (1 วัน) กับช่วงแรกของข้อมูล")
     oc = st.columns(2)
     for col, p in zip(oc, PHES):
@@ -948,8 +970,8 @@ with tab0:
         with col:
             banner(p, h_["level"])
             k1, k2, k3 = st.columns(3)
-            k1.metric("Health Index ล่าสุด", f"{h_['hi'] * 100:.0f} %")
-            k2.metric("แนวโน้ม UA", f"{h_['slope']:+.2f} %/วัน", f"p = {h_['p']:.2f}", delta_color="off")
+            k1.metric("Health Index ล่าสุด", f"{h_['hi'] * 100:.0f} %", help="UA ล่าสุด (median 1 วัน) ÷ UA ช่วงแรกของข้อมูล; 100% = เท่าเดิม")
+            k2.metric("แนวโน้ม UA", f"{h_['slope']:+.2f} %/วัน", f"p = {h_['p']:.2f}", delta_color="off", help="ติดลบและ p < 0.05 = UA ลดลงจริง (สัญญาณ fouling)")
             k3.metric("ΔP lye ล่าสุด", f"{h_['dp_rec']:.2f}", f"{h_['dp_rec'] - h_['dp_base']:+.2f} จากช่วงแรก", delta_color="inverse")
             advice = {0: "ทำงานปกติ ไม่พบแนวโน้ม fouling — เฝ้าระวังต่อตามรอบ",
                       1: f"UA ต่ำกว่าช่วงแรกประมาณ {(1 - h_['hi']) * 100:.0f}% หรือมีแนวโน้มลดลง — ตรวจ ΔP และเตรียมแผนล้าง",
