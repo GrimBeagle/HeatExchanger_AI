@@ -1,5 +1,6 @@
 import io
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -444,7 +445,7 @@ iso_flag = bool(m["iso"].predict(feat)[0] == -1)
 ua_ratio = float(c["UA"]) / m["ua_med"]
 inside = all(m["rng"][k][0] - 0.5 <= v <= m["rng"][k][1] + 0.5 for k, v in (("th_i", th), ("tc_i", tc)))
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["1️⃣ Plant Data & AI Baseline", "2️⃣ Interactive Simulator", "3️⃣ AI Diagnostics",
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["🏠 Overview", "1️⃣ Plant Data & AI Baseline", "2️⃣ Interactive Simulator", "3️⃣ AI Diagnostics",
                                               "4️⃣ Fouling Lab", "5️⃣ Flow Sensitivity", "6️⃣ Model & Limitations", "7️⃣ Fault Classifier"])
 
 # ------------------------------------------------------------
@@ -904,3 +905,113 @@ with tab7:
     st.dataframe(cl_["dist"].rename("% ของข้อมูลจริง").to_frame(), use_container_width=True)
     st.caption("ที่ถูกจัดเป็นความผิดปกติในข้อมูลจริง = false alarm ของ classifier (ข้อมูลจริงช่วงนี้ไม่มีเหตุการณ์ผิดปกติที่ยืนยันได้) "
                "ใช้ cross-validation แบบแบ่งบล็อกเพื่อคำนวณความเบี่ยงเบนจากค่าปกติ")
+
+
+# ============================================================
+# แท็บ 0: Overview (ไฟจราจร) + Demo
+# ============================================================
+STATUS = {0: ("#2E8B57", "🟢 ปกติ"), 1: ("#C45A10", "🟡 เฝ้าระวัง"), 2: ("#A50000", "🔴 ควรวางแผนล้างเครื่อง")}
+
+
+def banner(title, level, size=26):
+    c, label = STATUS[level]
+    st.markdown(f"<div style='background:{c};color:white;padding:16px;border-radius:12px;font-size:{size}px;"
+                f"font-weight:700;text-align:center'>{title}: {label}</div>", unsafe_allow_html=True)
+
+
+def health_status(s, base_n=60, recent_n=24):
+    """ประเมินสุขภาพจากข้อมูลจริง: UA ล่าสุดเทียบช่วงแรก + แนวโน้ม + จุดผิดปกติล่าสุด"""
+    base, rec = s.UA.iloc[:base_n].median(), s.UA.iloc[-recent_n:].median()
+    hi = float(rec / base)
+    lr = linregress(s.day, s.UA)
+    slope, p = float(lr.slope / s.UA.median() * 100), float(lr.pvalue)
+    flag = float(s.anom.iloc[-recent_n:].mean())
+    level = 2 if (hi < 0.70 or (p < 0.05 and slope < -2)) else 1 if (hi < 0.85 or (p < 0.05 and slope < 0) or flag > 0.3) else 0
+    return dict(hi=hi, slope=slope, p=p, flag=flag, level=level, base=float(base),
+                dp_rec=float(s.dP_l.iloc[-recent_n:].median()), dp_base=float(s.dP_l.iloc[:base_n].median()))
+
+
+def make_syn(ml, sl, days, linf, tau, vl, vw, seed=1):
+    r = np.random.default_rng(seed)
+    n = days * 12
+    idx = r.integers(0, len(sl), n)
+    t = np.arange(n) / 12
+    loss = linf / 100 * (1 - np.exp(-t / tau))
+    thi, tci = sl.th_i.values[idx], sl.tc_i.values[idx]
+    tho, tco = predict(thi, tci, ml["ua_med"] * (1 - loss), vl, vw)[:2]
+    tho = np.round(tho + r.normal(0, .3, n))
+    tco = np.round(tco + r.normal(0, .3, n))
+    cc = calc(thi, tho, tci, tco, vl, vw)
+    out = pd.DataFrame({"t": t, "UA": cc["UA"], "th_o": tho, "loss": loss})
+    out["HI"] = out.UA.rolling(24, min_periods=12).median() / ml["ua_med"]
+    return out
+
+
+with tab0:
+    st.subheader("ภาพรวมสุขภาพเครื่องแลกเปลี่ยนความร้อน")
+    st.caption(f"คำนวณจากข้อมูลจริงถึง {raw.Time.max():%d %b %Y %H:%M} — เทียบ UA ล่าสุด (1 วัน) กับช่วงแรกของข้อมูล")
+    oc = st.columns(2)
+    for col, p in zip(oc, PHES):
+        sp_ = M[p]["scored"]
+        h_ = health_status(sp_)
+        with col:
+            banner(p, h_["level"])
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Health Index ล่าสุด", f"{h_['hi'] * 100:.0f} %")
+            k2.metric("แนวโน้ม UA", f"{h_['slope']:+.2f} %/วัน", f"p = {h_['p']:.2f}", delta_color="off")
+            k3.metric("ΔP lye ล่าสุด", f"{h_['dp_rec']:.2f}", f"{h_['dp_rec'] - h_['dp_base']:+.2f} จากช่วงแรก", delta_color="inverse")
+            advice = {0: "ทำงานปกติ ไม่พบแนวโน้ม fouling — เฝ้าระวังต่อตามรอบ",
+                      1: f"UA ต่ำกว่าช่วงแรกประมาณ {(1 - h_['hi']) * 100:.0f}% หรือมีแนวโน้มลดลง — ตรวจ ΔP และเตรียมแผนล้าง",
+                      2: "การระบายความร้อนลดลงมาก — ควรวางแผนล้างเครื่องโดยเร็ว"}[h_["level"]]
+            st.info(advice)
+            hi_s = sp_.UA.rolling(24, min_periods=12).median() / h_["base"]
+            fo = go.Figure(go.Scatter(x=sp_.Time, y=hi_s, mode="lines", name="Health Index"))
+            fo.add_hline(y=0.85, line_dash="dot", annotation_text="เตือน")
+            fo.add_hline(y=0.70, line_dash="dot", annotation_text="ล้าง")
+            fo.update_layout(height=260, yaxis_tickformat=".0%", yaxis_range=[0.4, 1.3], margin=dict(t=20, b=20), showlegend=False)
+            st.plotly_chart(fo, use_container_width=True)
+    with st.expander("ระบบตัดสินสถานะอย่างไร"):
+        st.markdown("- 🔴 Health Index < 70% หรือ UA ลดลงเกิน 2%/วันอย่างมีนัยสำคัญ\n"
+                    "- 🟡 Health Index < 85%, มีแนวโน้มลดลงอย่างมีนัยสำคัญ, หรือจุดผิดปกติเกิน 30% ในวันล่าสุด\n"
+                    "- 🟢 นอกเหนือจากนั้น\n\n"
+                    "Health Index = UA ล่าสุด (median 1 วัน) ÷ UA ช่วงแรกของข้อมูล (60 จุดแรก)")
+
+    st.divider()
+    st.markdown("### ▶ Demo: เล่นสถานการณ์ fouling สะสม (ข้อมูลสังเคราะห์)")
+    st.caption("จำลองเครื่องที่สกปรกขึ้นทีละวัน ดูว่าระบบเตือนวันไหนเทียบกับวันที่ควรเตือนจริง")
+    d1, d2, d3, d4 = st.columns(4)
+    dphe = d1.radio("เครื่อง", PHES, key="demo_phe", horizontal=True)
+    dd_ = d2.slider("จำนวนวัน", 20, 90, 45, key="demo_days")
+    dl_ = d3.slider("UA ลดลงสุดท้าย (%)", 10, 70, 45, key="demo_loss")
+    sp_s = d4.select_slider("ความเร็ว", ["ช้า", "กลาง", "เร็ว"], value="กลาง", key="demo_speed")
+    if st.button("▶ เริ่ม Demo", type="primary", key="demo_go"):
+        mm_ = M[dphe]
+        syn_ = make_syn(mm_, mm_["scored"], dd_, dl_, max(dd_ / 2.5, 5), vl0, vw0)
+        delay, ph_ = {"ช้า": 0.35, "กลาง": 0.15, "เร็ว": 0.04}[sp_s], st.empty()
+        wd_ = cd_ = None
+        for day in range(1, dd_ + 1):
+            cur = syn_[syn_.t < day]
+            hi_ = float(cur.HI.dropna().iloc[-1]) if cur.HI.notna().any() else 1.0
+            lv_ = 2 if hi_ < 0.70 else 1 if hi_ < 0.85 else 0
+            wd_ = day if (lv_ >= 1 and wd_ is None) else wd_
+            cd_ = day if (lv_ == 2 and cd_ is None) else cd_
+            with ph_.container():
+                banner(f"{dphe} · วันที่ {day}", lv_, 22)
+                q1, q2, q3 = st.columns(3)
+                q1.metric("Health Index (ระบบวัดได้)", f"{hi_ * 100:.0f} %")
+                q2.metric("UA ลดลงจริงในแบบจำลอง", f"{cur.loss.iloc[-1] * 100:.0f} %")
+                q3.metric("Lye outlet เฉลี่ย 1 วัน", f"{cur.th_o.iloc[-12:].mean():.1f} °C")
+                fd = go.Figure()
+                fd.add_scatter(x=cur.t, y=cur.HI, name="Health Index (วัดได้)")
+                fd.add_scatter(x=cur.t, y=1 - cur.loss, name="ค่าจริงในแบบจำลอง", line_dash="dash")
+                fd.add_hline(y=0.85, line_dash="dot", annotation_text="เตือน")
+                fd.add_hline(y=0.70, line_dash="dot", annotation_text="ล้าง")
+                fd.update_layout(height=320, xaxis_range=[0, dd_], yaxis_range=[0.4, 1.15], yaxis_tickformat=".0%",
+                                 xaxis_title="วัน", margin=dict(t=20, b=20), legend=dict(orientation="h", y=-0.3))
+                st.plotly_chart(fd, use_container_width=True)
+            time.sleep(delay)
+        tw = next((d for d, l in zip(syn_.t, 1 - syn_.loss) if l < 0.85), None)
+        tcl = next((d for d, l in zip(syn_.t, 1 - syn_.loss) if l < 0.70), None)
+        f_ = lambda v: "ไม่ถึงเกณฑ์" if v is None else f"วันที่ {v:.0f}"
+        st.success(f"สรุป: ระบบเตือนครั้งแรก {f_(wd_)} (จริงควรเตือน {f_(tw)}) · ถึงเกณฑ์ล้าง {f_(cd_)} (จริง {f_(tcl)})")
+        st.caption("ข้อมูลสังเคราะห์จากแบบจำลองฟิสิกส์ + อุณหภูมิขาเข้าจริง ไม่ใช่ข้อมูล fouling จริงของโรงงาน")
